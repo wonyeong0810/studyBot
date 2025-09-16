@@ -13,10 +13,10 @@ load_dotenv()
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 DEFAULT_TZ = ZoneInfo("Asia/Seoul")
-CHECK_TIME = datetime.time(hour=0, minute=5, tzinfo=DEFAULT_TZ)  # 매일 00:05(KST)
-REMINDER_TIME_1H = datetime.time(hour=23, minute=5, tzinfo=DEFAULT_TZ)   # 매일 23:05(KST)
-REMINDER_TIME_30M = datetime.time(hour=23, minute=35, tzinfo=DEFAULT_TZ) # 매일 23:35(KST)
-REMINDER_TIME_10M = datetime.time(hour=23, minute=55, tzinfo=DEFAULT_TZ) # 매일 23:55(KST)
+CHECK_TIME = datetime.time(hour=5, minute=0, tzinfo=DEFAULT_TZ)  # 매일 05:00(KST)
+REMINDER_TIME_1H = datetime.time(hour=4, minute=0, tzinfo=DEFAULT_TZ)   # 매일 04:00(KST)
+REMINDER_TIME_30M = datetime.time(hour=4, minute=30, tzinfo=DEFAULT_TZ) # 매일 04:30(KST)
+REMINDER_TIME_10M = datetime.time(hour=4, minute=50, tzinfo=DEFAULT_TZ) # 매일 04:50(KST)
 
 # 예쁘게 출력용 헬퍼
 COLOR_OK = 0x2ecc71
@@ -217,24 +217,28 @@ async def daily_check():
 
 # 공통 리마인더 발송 함수
 async def _send_pending_reminder(label: str):
-    date = today_str(DEFAULT_TZ)
+    # 05:00 이전엔 전날 미인증자 기준으로 안내
+    now = datetime.datetime.now(DEFAULT_TZ)
+    now_minutes = now.hour * 60 + now.minute
+    cutoff_minutes = CHECK_TIME.hour * 60 + CHECK_TIME.minute
+    target_date = yesterday_str(DEFAULT_TZ) if now_minutes < cutoff_minutes else today_str(DEFAULT_TZ)
+
     for guild in bot.guilds:
         channel_id = store.get_channel(guild.id)
         if not channel_id:
             continue
-        pending = store.pending_for_date(guild.id, date)
+        pending = store.pending_for_date(guild.id, target_date)
         if not pending:
             continue
         channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
-        # 한 줄에 하나씩 멘션해 가독성 향상
         mentions = "\n".join(f"- <@{uid}>" for uid in pending)
         desc = (
             f"미인증 인원: {len(pending)}명\n"
-            f"마감 안내: 자정(24:00) 마감, 00:05에 벌점 부과\n\n"
+            f"마감 안내: 새벽 5시(05:00) 마감, 05:00에 벌점 부과\n\n"
             f"{mentions}"
         )
         embed = make_embed(
-            title=f"벌점 부과 {label} 알림 ({date})",
+            title=f"벌점 부과 {label} 알림 ({target_date})",
             description=desc,
             color=COLOR_WARN
         )
@@ -280,7 +284,12 @@ async def on_message(message: discord.Message):
     if not has_image:
         return
 
-    date = today_str(DEFAULT_TZ)
+    # 새벽(05:00 이전) 인증은 전날로 집계
+    now = datetime.datetime.now(DEFAULT_TZ)
+    now_minutes = now.hour * 60 + now.minute
+    cutoff_minutes = CHECK_TIME.hour * 60 + CHECK_TIME.minute
+    date = yesterday_str(DEFAULT_TZ) if now_minutes < cutoff_minutes else today_str(DEFAULT_TZ)
+
     if store.has_submitted(message.guild.id, date, message.author.id):
         return
 
@@ -419,7 +428,7 @@ async def study_help(ctx: commands.Context):
         "!study-leaderboard        벌점 랭킹\n"
         "```\n"
         "인증은 설정된 채널에 이미지(사진)를 올리면 자동 처리됩니다.\n"
-        "전날 미인증자에게는 다음날 00:05(KST)에 1,000원 벌점이 부과됩니다."
+        "전날 미인증자에게는 다음날 05:00(KST)에 1,000원 벌점이 부과됩니다."
     )
     embed = make_embed(title="공부봇 사용법", description=desc, color=COLOR_INFO)
     await ctx.reply(embed=embed, mention_author=False)
