@@ -18,11 +18,41 @@ REMINDER_TIME_1H = datetime.time(hour=23, minute=5, tzinfo=DEFAULT_TZ)   # 매�
 REMINDER_TIME_30M = datetime.time(hour=23, minute=35, tzinfo=DEFAULT_TZ) # 매일 23:35(KST)
 REMINDER_TIME_10M = datetime.time(hour=23, minute=55, tzinfo=DEFAULT_TZ) # 매일 23:55(KST)
 
+# 예쁘게 출력용 헬퍼
+COLOR_OK = 0x2ecc71
+COLOR_WARN = 0xf1c40f
+COLOR_INFO = 0x3498db
+COLOR_DANGER = 0xe74c3c
+COLOR_MUTED = 0x95a5a6
+
+def fmt_won(n: int) -> str:
+    return f"{n:,}원"
+
+def make_embed(title: str, description: str = "", color: int = COLOR_INFO) -> discord.Embed:
+    e = discord.Embed(title=title, description=description, color=color)
+    e.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    return e
+
 def today_str(tz: ZoneInfo = DEFAULT_TZ) -> str:
     return datetime.datetime.now(tz).date().isoformat()
 
-def date_str_for(dt: datetime.datetime) -> str:
-    return dt.date().isoformat()
+# 가독성 헬퍼
+def shorten(text: str, max_len: int = 20) -> str:
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+def make_table(headers: list[str], rows: list[list[str]], widths: list[int]) -> str:
+    def fmt_row(cols: list[str]) -> str:
+        parts = []
+        for i, col in enumerate(cols):
+            w = widths[i]
+            align = ">" if i == len(cols) - 1 else "<"  # 마지막 열(숫자)은 우측 정렬
+            parts.append(f"{col:{align}{w}}")
+        return " ".join(parts)
+
+    header_line = fmt_row(headers)
+    sep_line = " ".join("-" * w for w in widths)
+    body_lines = [fmt_row(r) for r in rows]
+    return "```\n" + "\n".join([header_line, sep_line, *body_lines]) + "\n```"
 
 def yesterday_str(tz: ZoneInfo = DEFAULT_TZ) -> str:
     return (datetime.datetime.now(tz).date() - datetime.timedelta(days=1)).isoformat()
@@ -170,13 +200,18 @@ async def daily_check():
         if channel_id:
             channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
             try:
-                lines = []
+                rows = []
                 for uid, debt in changed:
                     member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
                     name = member.display_name if member else f"User {uid}"
-                    lines.append(f"- {name}: 누락 1회 → 현재 벌점 {debt}원")
-                msg = f"[{ymd}] 인증 누락 정산 결과\n" + "\n".join(lines)
-                await channel.send(msg)
+                    rows.append([shorten(name, 20), fmt_won(debt)])
+                table = make_table(["사용자", "현재 벌점"], rows, [20, 12])
+                embed = make_embed(
+                    title=f"[{ymd}] 인증 누락 정산 결과",
+                    description=table,
+                    color=COLOR_DANGER
+                )
+                await channel.send(embed=embed)
             except discord.HTTPException:
                 pass
 
@@ -191,14 +226,20 @@ async def _send_pending_reminder(label: str):
         if not pending:
             continue
         channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
-        mentions = " ".join(f"<@{uid}>" for uid in pending)
-        msg = (
-            f"⏰ 벌점 부과 {label} 알림 ({date})\n"
-            f"{mentions}\n"
-            "아직 인증하지 않았습니다. 자정까지 인증하지 않으면 00:05에 1000원 벌점이 부과됩니다."
+        # 한 줄에 하나씩 멘션해 가독성 향상
+        mentions = "\n".join(f"- <@{uid}>" for uid in pending)
+        desc = (
+            f"미인증 인원: {len(pending)}명\n"
+            f"마감 안내: 자정(24:00) 마감, 00:05에 벌점 부과\n\n"
+            f"{mentions}"
+        )
+        embed = make_embed(
+            title=f"벌점 부과 {label} 알림 ({date})",
+            description=desc,
+            color=COLOR_WARN
         )
         try:
-            await channel.send(msg)
+            await channel.send(embed=embed)
         except discord.HTTPException:
             pass
 
@@ -246,7 +287,13 @@ async def on_message(message: discord.Message):
     await store.mark_submission(message.guild.id, date, message.author.id)
     try:
         await message.add_reaction("✅")
-        await message.reply(f"{message.author.mention} 오늘 인증 완료! ({date})", mention_author=False)
+        embed = make_embed(
+            title="오늘 인증 완료",
+            description=f"{message.author.mention}의 {date} 인증이 기록되었습니다.",
+            color=COLOR_OK
+        )
+        embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+        await message.reply(embed=embed, mention_author=False)
     except discord.HTTPException:
         pass
 
@@ -254,75 +301,128 @@ async def on_message(message: discord.Message):
 @commands.has_permissions(manage_guild=True)
 async def study_channel(ctx: commands.Context, channel: discord.TextChannel):
     await store.set_channel(ctx.guild.id, channel.id)
-    await ctx.reply(f"인증 채널이 {channel.mention} 로 설정되었습니다.", mention_author=False)
+    embed = make_embed(
+        title="🔧 인증 채널 설정 완료",
+        description=f"이제부터 {channel.mention} 에서 인증을 받습니다.",
+        color=COLOR_INFO
+    )
+    await ctx.reply(embed=embed, mention_author=False)
 
 @study_channel.error
 async def study_channel_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("이 명령은 서버 관리 권한이 필요합니다.", mention_author=False)
+        embed = make_embed(
+            title="⛔ 권한 부족",
+            description="이 명령은 서버 관리 권한이 필요합니다.",
+            color=COLOR_DANGER
+        )
     else:
-        await ctx.reply("사용법: !study-channel #인증채널", mention_author=False)
+        embed = make_embed(
+            title="ℹ️ 사용법",
+            description="`!study-channel #인증채널`",
+            color=COLOR_MUTED
+        )
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-join")
 async def study_join(ctx: commands.Context):
     await store.join(ctx.guild.id, ctx.author.id)
-    await ctx.reply(f"{ctx.author.mention} 스터디에 참가되었습니다. 매일 인증 채널에 사진을 올리세요!", mention_author=False)
+    embed = make_embed(
+        title="✅ 참가 완료",
+        description=f"{ctx.author.mention} 스터디에 참가되었습니다.\n매일 인증 채널에 사진을 올려 인증해 주세요!",
+        color=COLOR_OK
+    )
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-leave")
 async def study_leave(ctx: commands.Context):
     await store.leave(ctx.guild.id, ctx.author.id)
-    await ctx.reply(f"{ctx.author.mention} 스터디에서 제외되었습니다.", mention_author=False)
+    embed = make_embed(
+        title="👋 탈퇴 완료",
+        description=f"{ctx.author.mention} 스터디에서 제외되었습니다.",
+        color=COLOR_MUTED
+    )
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-status")
 async def study_status(ctx: commands.Context, member: discord.Member | None = None):
     member = member or ctx.author
     debt = store.get_debt(ctx.guild.id, member.id)
-    await ctx.reply(f"{member.display_name} 현재 벌점: {debt}원", mention_author=False)
+    color = COLOR_DANGER if debt > 0 else COLOR_OK
+    embed = make_embed(
+        title="현재 벌점",
+        description=f"{member.mention} — {fmt_won(debt)}",
+        color=color
+    )
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-check")
 async def study_check(ctx: commands.Context, member: discord.Member | None = None):
-    """지정한 사용자(없으면 본인)의 오늘 인증 여부 확인"""
     member = member or ctx.author
     date = today_str(DEFAULT_TZ)
     done = store.has_submitted(ctx.guild.id, date, member.id)
-    msg = (
-        f"{member.display_name}은(는) 오늘({date}) 인증을 완료했습니다."
-        if done
-        else f"{member.display_name}은(는) 오늘({date}) 아직 인증하지 않았습니다."
-    )
-    await ctx.reply(msg, mention_author=False)
+    if done:
+        embed = make_embed(
+            title="오늘 인증 상태",
+            description=f"{member.mention}은(는) 오늘({date}) 인증을 완료했습니다.",
+            color=COLOR_OK
+        )
+    else:
+        embed = make_embed(
+            title="오늘 인증 상태",
+            description=f"{member.mention}은(는) 오늘({date}) 아직 인증하지 않았습니다.",
+            color=COLOR_WARN
+        )
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-leaderboard")
 async def study_leaderboard(ctx: commands.Context):
     top = store.leaderboard(ctx.guild.id, limit=10)
     if not top:
-        await ctx.reply("아직 집계된 기록이 없습니다.", mention_author=False)
+        embed = make_embed(
+            title="벌점 랭킹",
+            description="아직 집계된 기록이 없습니다.",
+            color=COLOR_MUTED
+        )
+        await ctx.reply(embed=embed, mention_author=False)
         return
-    lines = []
+
+    rows = []
     for i, (uid, debt) in enumerate(top, start=1):
         try:
             member = ctx.guild.get_member(int(uid)) or await ctx.guild.fetch_member(int(uid))
             name = member.display_name if member else f"User {uid}"
         except discord.HTTPException:
             name = f"User {uid}"
-        lines.append(f"{i}. {name} — {debt}원")
+        rows.append([str(i), shorten(name, 20), fmt_won(debt)])
+
+    table = make_table(headers=["순위", "사용자", "벌점"], rows=rows, widths=[4, 20, 12])
     total = store.total_debt(ctx.guild.id)
-    await ctx.reply("벌점 랭킹 Top 10\n" + "\n".join(lines) + f"\n총 벌점: {total}원", mention_author=False)
+    embed = make_embed(
+        title="벌점 랭킹 Top 10",
+        description=table,
+        color=COLOR_INFO
+    )
+    embed.add_field(name="총 벌점", value=fmt_won(total), inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-help")
 async def study_help(ctx: commands.Context):
-    msg = (
-        "공부봇 사용법\n"
-        "- !study-channel #채널: 인증 채널 설정(관리자)\n"
-        "- !study-join: 스터디 참가\n"
-        "- !study-leave: 스터디 탈퇴\n"
-        "- !study-status [@유저]: 현재 벌점 확인\n"
-        "- !study-check [@유저]: 오늘 인증 여부 확인\n"
-        "- !study-leaderboard: 벌점 랭킹\n"
-        "인증은 설정된 채널에 이미지(사진) 올리면 자동으로 처리됩니다.\n"
-        "매일 00:05(KST)에 전날 미인증자에게 1000원 벌점이 부과됩니다."
+    desc = (
+        "```\n"
+        "명령어\n"
+        "!study-channel #채널      인증 채널 설정 (관리자)\n"
+        "!study-join               스터디 참가\n"
+        "!study-leave              스터디 탈퇴\n"
+        "!study-status [@유저]     현재 벌점 확인\n"
+        "!study-check  [@유저]     오늘 인증 여부 확인\n"
+        "!study-leaderboard        벌점 랭킹\n"
+        "```\n"
+        "인증은 설정된 채널에 이미지(사진)를 올리면 자동 처리됩니다.\n"
+        "전날 미인증자에게는 다음날 00:05(KST)에 1,000원 벌점이 부과됩니다."
     )
-    await ctx.reply(msg, mention_author=False)
+    embed = make_embed(title="공부봇 사용법", description=desc, color=COLOR_INFO)
+    await ctx.reply(embed=embed, mention_author=False)
 
 def main():
     token = os.getenv("DISCORD_TOKEN")
