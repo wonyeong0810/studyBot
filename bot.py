@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv  # 추가
+from motor.motor_asyncio import AsyncIOMotorClient  # 추가
 
 # .env 로드 (프로젝트 루트의 .env 파일 자동 탐색)
 load_dotenv()
@@ -87,6 +88,10 @@ class DataStore:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
 
+    # 동기 → 비동기로 변경 (MongoStore와 인터페이스 통일)
+    async def get_channel(self, guild_id: int) -> int | None:
+        return self._g(guild_id).get("channel_id")
+
     def _g(self, guild_id: int) -> dict:
         g = self.data["guilds"].setdefault(str(guild_id), {
             "channel_id": None,
@@ -100,9 +105,6 @@ class DataStore:
         g = self._g(guild_id)
         g["channel_id"] = channel_id
         await self.save()
-
-    def get_channel(self, guild_id: int) -> int | None:
-        return self._g(guild_id).get("channel_id")
 
     async def join(self, guild_id: int, user_id: int):
         g = self._g(guild_id)
@@ -119,8 +121,12 @@ class DataStore:
             g["participants"].remove(uid)
         await self.save()
 
-    def is_participant(self, guild_id: int, user_id: int) -> bool:
+    async def is_participant(self, guild_id: int, user_id: int) -> bool:
         return str(user_id) in self._g(guild_id)["participants"]
+
+    async def has_submitted(self, guild_id: int, date: str, user_id: int) -> bool:
+        g = self._g(guild_id)
+        return str(user_id) in g["submissions"].get(date, [])
 
     async def mark_submission(self, guild_id: int, date: str, user_id: int):
         g = self._g(guild_id)
@@ -129,10 +135,6 @@ class DataStore:
         if uid not in day:
             day.append(uid)
             await self.save()
-
-    def has_submitted(self, guild_id: int, date: str, user_id: int) -> bool:
-        g = self._g(guild_id)
-        return str(user_id) in g["submissions"].get(date, [])
 
     async def apply_penalties_for_date(self, guild_id: int, date: str) -> list[tuple[str, int]]:
         """전날(date)에 인증 안 한 참가자들에게 1000원씩 벌점 부과."""
@@ -147,28 +149,134 @@ class DataStore:
         await self.save()
         return changed
 
-    def get_debt(self, guild_id: int, user_id: int) -> int:
+    async def get_debt(self, guild_id: int, user_id: int) -> int:
         g = self._g(guild_id)
         return g["debt"].get(str(user_id), 0)
 
-    def leaderboard(self, guild_id: int, limit: int = 10) -> list[tuple[str, int]]:
+    async def leaderboard(self, guild_id: int, limit: int = 10) -> list[tuple[str, int]]:
         g = self._g(guild_id)
         items = list(g["debt"].items())
         items.sort(key=lambda x: x[1], reverse=True)
         return items[:limit]
 
-    def total_debt(self, guild_id: int) -> int:
+    async def total_debt(self, guild_id: int) -> int:
         g = self._g(guild_id)
         return sum(g["debt"].values())
 
-    def pending_for_date(self, guild_id: int, date: str) -> list[str]:
-        """date(YYYY-MM-DD)에 아직 인증하지 않은 참가자 user_id(str) 목록"""
+    async def pending_for_date(self, guild_id: int, date: str) -> list[str]:
         g = self._g(guild_id)
         participants = set(g["participants"])
         submitted = set(g["submissions"].get(date, []))
         return sorted(participants - submitted)
 
-store = DataStore(DATA_FILE)
+# MongoDB 저장소 추가
+class MongoStore:
+    def __init__(self, client: AsyncIOMotorClient, db_name: str = "studybot", coll_name: str = "guilds"):
+        self.client = client
+        self.db = client[db_name]
+        self.coll = self.db[coll_name]
+
+    async def load(self):  # 인터페이스 맞춤 (무동작)
+        return
+
+    async def save(self):  # 인터페이스 맞춤 (무동작)
+        return
+
+    async def _ensure_doc(self, guild_id: int):
+        await self.coll.update_one(
+            {"_id": str(guild_id)},
+            {"$setOnInsert": {
+                "channel_id": None,
+                "participants": [],
+                "debt": {},
+                "submissions": {}
+            }},
+            upsert=True
+        )
+
+    async def _get(self, guild_id: int) -> dict:
+        doc = await self.coll.find_one({"_id": str(guild_id)})
+        if not doc:
+            await self._ensure_doc(guild_id)
+            doc = await self.coll.find_one({"_id": str(guild_id)})
+        return doc or {}
+
+    async def set_channel(self, guild_id: int, channel_id: int):
+        await self._ensure_doc(guild_id)
+        await self.coll.update_one({"_id": str(guild_id)}, {"$set": {"channel_id": channel_id}})
+
+    async def get_channel(self, guild_id: int) -> int | None:
+        doc = await self._get(guild_id)
+        return doc.get("channel_id")
+
+    async def join(self, guild_id: int, user_id: int):
+        uid = str(user_id)
+        await self._ensure_doc(guild_id)
+        await self.coll.update_one({"_id": str(guild_id)}, {"$addToSet": {"participants": uid}})
+        doc = await self._get(guild_id)
+        if doc.get("debt", {}).get(uid) is None:
+            await self.coll.update_one({"_id": str(guild_id)}, {"$set": {f"debt.{uid}": 0}})
+
+    async def leave(self, guild_id: int, user_id: int):
+        uid = str(user_id)
+        await self._ensure_doc(guild_id)
+        await self.coll.update_one({"_id": str(guild_id)}, {"$pull": {"participants": uid}})
+
+    async def is_participant(self, guild_id: int, user_id: int) -> bool:
+        doc = await self._get(guild_id)
+        return str(user_id) in doc.get("participants", [])
+
+    async def mark_submission(self, guild_id: int, date: str, user_id: int):
+        uid = str(user_id)
+        await self._ensure_doc(guild_id)
+        await self.coll.update_one({"_id": str(guild_id)}, {"$addToSet": {f"submissions.{date}": uid}})
+
+    async def has_submitted(self, guild_id: int, date: str, user_id: int) -> bool:
+        doc = await self._get(guild_id)
+        return str(user_id) in doc.get("submissions", {}).get(date, [])
+
+    async def apply_penalties_for_date(self, guild_id: int, date: str) -> list[tuple[str, int]]:
+        doc = await self._get(guild_id)
+        participants = set(doc.get("participants", []))
+        submitted = set(doc.get("submissions", {}).get(date, []))
+        missed = sorted(participants - submitted)
+        if not missed:
+            return []
+        inc = {f"debt.{uid}": 1000 for uid in missed}
+        await self.coll.update_one({"_id": str(guild_id)}, {"$inc": inc})
+        doc2 = await self._get(guild_id)
+        return [(uid, int(doc2.get("debt", {}).get(uid, 0))) for uid in missed]
+
+    async def get_debt(self, guild_id: int, user_id: int) -> int:
+        doc = await self._get(guild_id)
+        return int(doc.get("debt", {}).get(str(user_id), 0))
+
+    async def leaderboard(self, guild_id: int, limit: int = 10) -> list[tuple[str, int]]:
+        doc = await self._get(guild_id)
+        items = [(k, int(v)) for k, v in doc.get("debt", {}).items()]
+        items.sort(key=lambda x: x[1], reverse=True)
+        return items[:limit]
+
+    async def total_debt(self, guild_id: int) -> int:
+        doc = await self._get(guild_id)
+        return int(sum(int(v) for v in doc.get("debt", {}).values()))
+
+    async def pending_for_date(self, guild_id: int, date: str) -> list[str]:
+        doc = await self._get(guild_id)
+        participants = set(doc.get("participants", []))
+        submitted = set(doc.get("submissions", {}).get(date, []))
+        return sorted(participants - submitted)
+
+# 기존 파일 저장소 → MongoDB로 전환 (MONGODB_URI 없으면 파일 방식 사용)
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DB = os.getenv("MONGODB_DB", "studybot")
+MONGODB_COLL = os.getenv("MONGODB_COLL", "guilds")
+
+if MONGODB_URI:
+    mongo_client = AsyncIOMotorClient(MONGODB_URI, uuidRepresentation="standard")
+    store = MongoStore(mongo_client, MONGODB_DB, MONGODB_COLL)
+else:
+    store = DataStore(DATA_FILE)
 
 intents = discord.Intents.default()
 intents.message_content = True  # 인증 메시지/첨부 확인
@@ -224,10 +332,10 @@ async def _send_pending_reminder(label: str):
     target_date = yesterday_str(DEFAULT_TZ) if now_minutes < cutoff_minutes else today_str(DEFAULT_TZ)
 
     for guild in bot.guilds:
-        channel_id = store.get_channel(guild.id)
+        channel_id = await store.get_channel(guild.id)
         if not channel_id:
             continue
-        pending = store.pending_for_date(guild.id, target_date)
+        pending = await store.pending_for_date(guild.id, target_date)
         if not pending:
             continue
         channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
@@ -270,14 +378,10 @@ async def on_message(message: discord.Message):
 
     # 명령어 처리 먼저
     await bot.process_commands(message)
-
-    # 인증 채널에서 이미지 첨부 시 인증 처리
-    channel_id = store.get_channel(message.guild.id)
+    channel_id = await store.get_channel(message.guild.id)
     if not channel_id or message.channel.id != channel_id:
         return
-
-    # 참가자만 인증 인정
-    if not store.is_participant(message.guild.id, message.author.id):
+    if not await store.is_participant(message.guild.id, message.author.id):
         return
 
     has_image = any(is_image_attachment(att) for att in message.attachments)
@@ -290,7 +394,7 @@ async def on_message(message: discord.Message):
     cutoff_minutes = CHECK_TIME.hour * 60 + CHECK_TIME.minute
     date = yesterday_str(DEFAULT_TZ) if now_minutes < cutoff_minutes else today_str(DEFAULT_TZ)
 
-    if store.has_submitted(message.guild.id, date, message.author.id):
+    if await store.has_submitted(message.guild.id, date, message.author.id):
         return
 
     await store.mark_submission(message.guild.id, date, message.author.id)
@@ -334,11 +438,39 @@ async def study_channel_error(ctx: commands.Context, error):
     await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="study-join")
-async def study_join(ctx: commands.Context):
-    await store.join(ctx.guild.id, ctx.author.id)
+async def study_join(ctx: commands.Context, member: discord.Member | None = None):
+    target = member or ctx.author
+
+    # 다른 사람을 추가하려면 관리자 권한 필요
+    if member and member.id != ctx.author.id:
+        if not ctx.author.guild_permissions.manage_guild:
+            embed = make_embed(
+                title="⛔ 권한 부족",
+                description="다른 사용자를 참가시키려면 서버 관리 권한이 필요합니다.",
+                color=COLOR_DANGER
+            )
+            await ctx.reply(embed=embed, mention_author=False)
+            return
+
+    # 봇 계정 방지
+    if target.bot:
+        embed = make_embed(
+            title="⚠️ 참가 불가",
+            description="봇 계정은 참가시킬 수 없습니다.",
+            color=COLOR_WARN
+        )
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+
+    await store.join(ctx.guild.id, target.id)
+    if target.id == ctx.author.id:
+        desc = f"{ctx.author.mention} 스터디에 참가되었습니다.\n매일 인증 채널에 사진을 올려 인증해 주세요!"
+    else:
+        desc = f"{target.mention} 이(가) 스터디에 참가되었습니다. (추가: {ctx.author.mention})"
+
     embed = make_embed(
-        title="✅ 참가 완료",
-        description=f"{ctx.author.mention} 스터디에 참가되었습니다.\n매일 인증 채널에 사진을 올려 인증해 주세요!",
+        title="참가 처리 완료",
+        description=desc,
         color=COLOR_OK
     )
     await ctx.reply(embed=embed, mention_author=False)
@@ -356,7 +488,7 @@ async def study_leave(ctx: commands.Context):
 @bot.command(name="study-status")
 async def study_status(ctx: commands.Context, member: discord.Member | None = None):
     member = member or ctx.author
-    debt = store.get_debt(ctx.guild.id, member.id)
+    debt = await store.get_debt(ctx.guild.id, member.id)
     color = COLOR_DANGER if debt > 0 else COLOR_OK
     embed = make_embed(
         title="현재 벌점",
@@ -369,7 +501,7 @@ async def study_status(ctx: commands.Context, member: discord.Member | None = No
 async def study_check(ctx: commands.Context, member: discord.Member | None = None):
     member = member or ctx.author
     date = today_str(DEFAULT_TZ)
-    done = store.has_submitted(ctx.guild.id, date, member.id)
+    done = await store.has_submitted(ctx.guild.id, date, member.id)
     if done:
         embed = make_embed(
             title="오늘 인증 상태",
@@ -386,7 +518,7 @@ async def study_check(ctx: commands.Context, member: discord.Member | None = Non
 
 @bot.command(name="study-leaderboard")
 async def study_leaderboard(ctx: commands.Context):
-    top = store.leaderboard(ctx.guild.id, limit=10)
+    top = await store.leaderboard(ctx.guild.id, limit=10)
     if not top:
         embed = make_embed(
             title="벌점 랭킹",
@@ -406,7 +538,7 @@ async def study_leaderboard(ctx: commands.Context):
         rows.append([str(i), shorten(name, 20), fmt_won(debt)])
 
     table = make_table(headers=["순위", "사용자", "벌점"], rows=rows, widths=[4, 20, 12])
-    total = store.total_debt(ctx.guild.id)
+    total = await store.total_debt(ctx.guild.id)
     embed = make_embed(
         title="벌점 랭킹 Top 10",
         description=table,
@@ -421,7 +553,7 @@ async def study_help(ctx: commands.Context):
         "```\n"
         "명령어\n"
         "!study-channel #채널      인증 채널 설정 (관리자)\n"
-        "!study-join               스터디 참가\n"
+        "!study-join [@유저]       스터디 참가 (본인/지정 사용자)\n"
         "!study-leave              스터디 탈퇴\n"
         "!study-status [@유저]     현재 벌점 확인\n"
         "!study-check  [@유저]     오늘 인증 여부 확인\n"
