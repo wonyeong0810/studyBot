@@ -149,6 +149,14 @@ class DataStore:
         await self.save()
         return changed
 
+    async def add_penalty(self, guild_id: int, user_id: int, amount: int = 1000) -> int:
+        """특정 사용자에게 amount만큼 벌점 부과하고 현재 총 벌점을 반환."""
+        g = self._g(guild_id)
+        uid = str(user_id)
+        g["debt"][uid] = g["debt"].get(uid, 0) + amount
+        await self.save()
+        return g["debt"][uid]
+
     async def get_debt(self, guild_id: int, user_id: int) -> int:
         g = self._g(guild_id)
         return g["debt"].get(str(user_id), 0)
@@ -247,6 +255,14 @@ class MongoStore:
         doc2 = await self._get(guild_id)
         return [(uid, int(doc2.get("debt", {}).get(uid, 0))) for uid in missed]
 
+    async def add_penalty(self, guild_id: int, user_id: int, amount: int = 1000) -> int:
+        """특정 사용자에게 amount만큼 벌점 부과하고 현재 총 벌점을 반환."""
+        uid = str(user_id)
+        await self._ensure_doc(guild_id)
+        await self.coll.update_one({"_id": str(guild_id)}, {"$inc": {f"debt.{uid}": int(amount)}})
+        doc = await self._get(guild_id)
+        return int(doc.get("debt", {}).get(uid, 0))
+
     async def get_debt(self, guild_id: int, user_id: int) -> int:
         doc = await self._get(guild_id)
         return int(doc.get("debt", {}).get(str(user_id), 0))
@@ -304,19 +320,30 @@ async def daily_check():
         changed = await store.apply_penalties_for_date(guild.id, ymd)
         if not changed:
             continue
-        channel_id = store.get_channel(guild.id)
+        channel_id = await store.get_channel(guild.id)  # BUGFIX: await 추가
         if channel_id:
             channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
             try:
                 rows = []
+                mentions = []
                 for uid, debt in changed:
-                    member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
-                    name = member.display_name if member else f"User {uid}"
+                    try:
+                        member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+                        name = member.display_name if member else f"User {uid}"
+                    except discord.HTTPException:
+                        member = None
+                        name = f"User {uid}"
                     rows.append([shorten(name, 20), fmt_won(debt)])
+                    mentions.append(f"<@{uid}>")
                 table = make_table(["사용자", "현재 벌점"], rows, [20, 12])
+                desc = (
+                    f"다음 인원에게 1,000원 벌점이 부과되었습니다. ({ymd})\n"
+                    f"{' '.join(mentions)}\n\n"
+                    f"{table}"
+                )
                 embed = make_embed(
-                    title=f"[{ymd}] 인증 누락 정산 결과",
-                    description=table,
+                    title=f"[{ymd}] 인증 누락 벌점 부과 알림",
+                    description=desc,
                     color=COLOR_DANGER
                 )
                 await channel.send(embed=embed)
@@ -547,6 +574,42 @@ async def study_leaderboard(ctx: commands.Context):
     embed.add_field(name="총 벌점", value=fmt_won(total), inline=False)
     await ctx.reply(embed=embed, mention_author=False)
 
+@bot.command(name="minus")
+@commands.has_permissions(manage_guild=True)
+async def minus(ctx: commands.Context, member: discord.Member):
+    """지정 사용자에게 즉시 1,000원 벌점 부과"""
+    if member.bot:
+        embed = make_embed(
+            title="⚠️ 대상 불가",
+            description="봇 계정에는 벌점을 부과할 수 없습니다.",
+            color=COLOR_WARN
+        )
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+    new_debt = await store.add_penalty(ctx.guild.id, member.id, 1000)
+    embed = make_embed(
+        title="벌점 부과",
+        description=f"{member.mention} 1,000원 벌점이 부과되었습니다.\n현재 벌점: {fmt_won(new_debt)}",
+        color=COLOR_DANGER
+    )
+    await ctx.reply(embed=embed, mention_author=False)
+
+@minus.error
+async def minus_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        embed = make_embed(
+            title="⛔ 권한 부족",
+            description="이 명령은 서버 관리 권한이 필요합니다.",
+            color=COLOR_DANGER
+        )
+    else:
+        embed = make_embed(
+            title="ℹ️ 사용법",
+            description="`!minus @사용자`",
+            color=COLOR_MUTED
+        )
+    await ctx.reply(embed=embed, mention_author=False)
+
 @bot.command(name="study-help")
 async def study_help(ctx: commands.Context):
     desc = (
@@ -558,6 +621,7 @@ async def study_help(ctx: commands.Context):
         "!study-status [@유저]     현재 벌점 확인\n"
         "!study-check  [@유저]     오늘 인증 여부 확인\n"
         "!study-leaderboard        벌점 랭킹\n"
+        "!minus @유저              지정 유저에게 즉시 1,000원 벌점 (관리자)\n"
         "```\n"
         "인증은 설정된 채널에 이미지(사진)를 올리면 자동 처리됩니다.\n"
         "전날 미인증자에게는 다음날 05:00(KST)에 1,000원 벌점이 부과됩니다."
